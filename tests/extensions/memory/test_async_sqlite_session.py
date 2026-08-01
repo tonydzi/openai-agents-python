@@ -436,3 +436,78 @@ async def test_async_sqlite_session_pop_item_same_timestamp_returns_latest():
         assert _item_ids(remaining) == ["rs_pop_same_ts"]
 
         await session.close()
+
+
+async def test_async_sqlite_session_concurrent_close_is_safe():
+    """Two concurrent close() calls must not raise (issue #3983).
+
+    Before the fix, close() checked `self._connection is None` outside the
+    lock and dereferenced it inside: the first closer suspended on the await,
+    the second passed the outer check, then hit AttributeError on None.
+    """
+    import asyncio
+
+    session = AsyncSQLiteSession("concurrent_close")
+    await session.add_items([{"role": "user", "content": "hi"}])
+    results = await asyncio.gather(session.close(), session.close(), return_exceptions=True)
+    assert all(not isinstance(r, BaseException) for r in results)
+    # and close() stays idempotent after the fact
+    await session.close()
+
+
+async def test_async_sqlite_session_operations_after_close_raise():
+    """Operations after close() must raise, not silently re-open a connection
+    (issue #3983: without a closed flag, add_items() after close() committed
+    writes to a silently re-initialized connection)."""
+    session = AsyncSQLiteSession("use_after_close")
+    await session.add_items([{"role": "user", "content": "hi"}])
+    await session.close()
+
+    with pytest.raises(RuntimeError, match="closed"):
+        await session.add_items([{"role": "user", "content": "after"}])
+    with pytest.raises(RuntimeError, match="closed"):
+        await session.get_items()
+    with pytest.raises(RuntimeError, match="closed"):
+        await session.pop_item()
+    with pytest.raises(RuntimeError, match="closed"):
+        await session.clear_session()
+
+
+async def test_async_sqlite_session_write_after_close_not_persisted(tmp_path: Path):
+    """A rejected post-close write must not be visible to a fresh session on
+    the same database file."""
+    db = tmp_path / "close.db"
+    session = AsyncSQLiteSession("persist_check", db)
+    await session.add_items([{"role": "user", "content": "before"}])
+    await session.close()
+
+    with pytest.raises(RuntimeError):
+        await session.add_items([{"role": "user", "content": "after"}])
+
+    probe = AsyncSQLiteSession("persist_check", db)
+    items = await probe.get_items()
+    await probe.close()
+    assert len(items) == 1
+
+
+async def test_async_sqlite_session_cancelled_close_still_closes():
+    """Cancelling close() mid-flight must not leak the connection's worker
+    thread: the shielded inner close finishes and the session stays closed."""
+    import asyncio
+
+    session = AsyncSQLiteSession("cancelled_close")
+    await session.add_items([{"role": "user", "content": "hi"}])
+
+    task = asyncio.create_task(session.close())
+    await asyncio.sleep(0)  # let close() reach the awaited connection.close()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    # the session must be unusable afterwards, not silently reopened
+    with pytest.raises(RuntimeError, match="closed"):
+        await session.get_items()
+    # and a repeat close() is a safe no-op
+    await session.close()

@@ -57,6 +57,7 @@ class AsyncSQLiteSession(SessionABC):
         self.sessions_table = sessions_table
         self.messages_table = messages_table
         self._connection: aiosqlite.Connection | None = None
+        self._closed = False
         self._lock = asyncio.Lock()
         self._init_lock = asyncio.Lock()
 
@@ -96,6 +97,8 @@ class AsyncSQLiteSession(SessionABC):
 
     async def _get_connection(self) -> aiosqlite.Connection:
         """Get or create a database connection."""
+        if self._closed:
+            raise RuntimeError("AsyncSQLiteSession is closed")
         if self._connection is not None:
             return self._connection
 
@@ -288,9 +291,20 @@ class AsyncSQLiteSession(SessionABC):
             await conn.commit()
 
     async def close(self) -> None:
-        """Close the database connection."""
-        if self._connection is None:
-            return
+        """Close the database connection.
+
+        Safe to call multiple times and from concurrent tasks. After closing,
+        any further operation raises RuntimeError instead of silently
+        re-initializing a new connection.
+        """
         async with self._lock:
-            await self._connection.close()
-            self._connection = None
+            self._closed = True
+            connection, self._connection = self._connection, None
+        if connection is None:
+            return
+        # Close outside the lock: the connection is now unreachable to other
+        # tasks, so there is nothing left to race with — and a slow close no
+        # longer blocks every other (now failing-fast) operation. The shield
+        # keeps a cancelled close() from leaking the connection's worker
+        # thread; the session is already marked closed either way.
+        await asyncio.shield(connection.close())
